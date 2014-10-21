@@ -138,6 +138,11 @@ class Reporter(threading.Thread):
             if event_count:
                 self.submit_events(events)
 
+            service_checks = self.metrics_aggregator.flush_service_checks()
+            check_count = len(service_checks)
+            if check_count:
+                self.submit_service_checks(service_checks)
+
             should_log = self.flush_count <= FLUSH_LOGGING_INITIAL or self.log_count <= FLUSH_LOGGING_COUNT
             log_func = log.info
             if not should_log:
@@ -227,6 +232,38 @@ class Reporter(threading.Thread):
 
             finally:
                 conn.close()
+
+    def submit_service_checks(self, service_checks):
+        headers = {'Content-Type':'application/json'}
+        method = 'POST'
+
+        payload = {
+            'api_key': self.api_key,
+            'check_runs': service_checks
+        }
+
+        params = {}
+        if self.api_key:
+            params['api_key'] = self.api_key
+
+        url = '/api/v1/check_runs?{0}'.format(urlencode(params))
+
+        status = None
+        conn = self.http_conn_cls(self.api_host)
+        try:
+            start_time = time()
+            conn.request(method, url, json.dumps(payload), headers)
+
+            response = conn.getresponse()
+            status = response.status
+            response.close()
+            duration = round((time() - start_time) * 1000.0, 4)
+            log.debug("{0} {1} {2}{3} ({4}ms)" % (
+                            status, method, self.api_host, url, duration))
+
+
+        finally:
+            conn.close()
 
 class Server(object):
     """
