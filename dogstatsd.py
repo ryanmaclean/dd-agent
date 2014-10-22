@@ -258,7 +258,7 @@ class Reporter(threading.Thread):
             status = response.status
             response.close()
             duration = round((time() - start_time) * 1000.0, 4)
-            log.debug("{0} {1} {2}{3} ({4}ms)" % (
+            log.debug("{0} {1} {2}{3} ({4}ms)".format(
                             status, method, self.api_host, url, duration))
 
 
