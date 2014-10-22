@@ -460,7 +460,7 @@ class Aggregator(object):
         return parsed_packets
 
     def _unescape_content(self, string):
-        return string.replace('\\n', '\n').replace('|\m:', '|m:')
+        return string.replace('\\n', '\n').replace('m\:', 'm:')
 
     def parse_event_packet(self, packet):
         try:
@@ -502,25 +502,33 @@ class Aggregator(object):
     def parse_sc_packet(self, packet):
         try:
             _, data_and_metadata = packet.split('|', 1)
-
             # Service check syntax:
-            # _sc|check_name|status|meta|message
-            check_name, status, metadata = data_and_metadata.split('|', 2)
+            # _sc|check_name|status|meta
+            if data_and_metadata.count('|') == 1:
+                # Case with no metadata
+                check_name, status = data_and_metadata.split('|')
+                metadata = ''
+            else:
+                check_name, status, metadata = data_and_metadata.split('|', 2)
+
             service_check = {
                 'check_name': check_name,
                 'status': int(status)
             }
 
-            meta, message = metadata.rsplit('|m:', 1)
-            if message:
+            message_delimiter = '|m:' if '|m:' in metadata else 'm:'
+            if message_delimiter in metadata:
+                meta, message = metadata.rsplit(message_delimiter, 1)
                 service_check['message'] = self._unescape_content(message)
+            else:
+                meta = metadata
+
+            if not meta:
+                return service_check
 
             meta = unicode(meta)
-
-            for m in meta.split('|')[1:]:
-                if m[0] == u's':
-                    service_check['status'] = int(m[2:])
-                elif m[0] == u'd':
+            for m in meta.split('|'):
+                if m[0] == u'd':
                     service_check['timestamp'] = float(m[2:])
                 elif m[0] == u'i':
                     service_check['check_run_id'] = int(m[2:])
