@@ -459,7 +459,10 @@ class Aggregator(object):
 
         return parsed_packets
 
-    def _unescape_content(self, string):
+    def _unescape_sc_content(self, string):
+        return string.replace('\\n', '\n').replace('m\:', 'm:')
+
+    def _unescape_event_content(self, string):
         return string.replace('\\n', '\n').replace('m\:', 'm:')
 
     def parse_event_packet(self, packet):
@@ -477,7 +480,7 @@ class Aggregator(object):
 
             event = {
                 'title': metadata[:title_length],
-                'text': self._unescape_content(metadata[title_length+1:title_length+text_length+1])
+                'text': self._unescape_event_content(metadata[title_length+1:title_length+text_length+1])
             }
             meta = metadata[title_length+text_length+1:]
             for m in meta.split('|')[1:]:
@@ -519,7 +522,7 @@ class Aggregator(object):
             message_delimiter = '|m:' if '|m:' in metadata else 'm:'
             if message_delimiter in metadata:
                 meta, message = metadata.rsplit(message_delimiter, 1)
-                service_check['message'] = self._unescape_content(message)
+                service_check['message'] = self._unescape_sc_content(message)
             else:
                 meta = metadata
 
