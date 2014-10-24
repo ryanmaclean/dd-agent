@@ -147,7 +147,7 @@ class Reporter(threading.Thread):
             log_func = log.info
             if not should_log:
                 log_func = log.debug
-            log_func("Flush #%s: flushed %s metric%s and %s event%s" % (self.flush_count, count, plural(count), event_count, plural(event_count)))
+            log_func("Flush #%s: flushed %s metric%s, %s event%s, and %s service check run%s" % (self.flush_count, count, plural(count), event_count, plural(event_count), check_count, plural(check_count)))
             if self.flush_count == FLUSH_LOGGING_INITIAL:
                 log.info("First flushes done, %s flushes will be logged every %s flushes." % (FLUSH_LOGGING_COUNT, FLUSH_LOGGING_PERIOD))
 

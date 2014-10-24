@@ -631,6 +631,8 @@ class Aggregator(object):
 
         if hostname is not None:
             service_check['host_name'] = hostname
+        else:
+            service_check['host_name'] = self.hostname
         if check_run_id is not None:
             service_check['check_run_id'] = check_run_id
         if message is not None:
