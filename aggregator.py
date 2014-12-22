@@ -479,7 +479,7 @@ class Aggregator(object):
             text_length = int(text_length[:-1])
 
             event = {
-                'title': self._unescape_event_text(metadata[:title_length]),
+                'title': metadata[:title_length],
                 'text': self._unescape_event_text(metadata[title_length+1:title_length+text_length+1])
             }
             meta = metadata[title_length+text_length+1:]
