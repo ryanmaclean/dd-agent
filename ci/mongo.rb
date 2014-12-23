@@ -25,12 +25,12 @@ namespace :ci do
 
       # Set up the replica set + print some debug info
       sleep_for(15)
-      sh %Q{sudo mongo --eval "printjson(db.serverStatus())" 'localhost:37017' >> /tmp/mongo.log}
-      sh %Q{sudo mongo --eval "printjson(db.serverStatus())" 'localhost:37018' >> /tmp/mongo.log}
+#      sh %Q{sudo mongo --eval "printjson(db.serverStatus())" 'localhost:37017' >> /tmp/mongo.log}
+#      sh %Q{sudo mongo --eval "printjson(db.serverStatus())" 'localhost:37018' >> /tmp/mongo.log}
       sh %Q{sudo mongo --eval "printjson(rs.initiate()); printjson(rs.conf());" 'localhost:37017' >> /tmp/mongo.log}
       sleep_for(30)
-      sh %Q{sudo mongo --eval "printjson(rs.config()); printjson(rs.status());" 'localhost:37017' >> /tmp/mongo.log}
-      sh %Q{sudo mongo --eval "printjson(rs.config()); printjson(rs.status());" 'localhost:37018' >> /tmp/mongo.log}
+      sh %Q{sudo mongo --verbose --eval "printjson(rs.config()); printjson(rs.status());" 'localhost:37017' >> /tmp/mongo.log}
+      sh %Q{sudo mongo --verbose --eval "printjson(rs.config()); printjson(rs.status());" 'localhost:37018' >> /tmp/mongo.log}
     end
 
     task :script => ['ci:common:script'] do
