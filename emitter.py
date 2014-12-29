@@ -18,8 +18,10 @@ requests_log.propagate = True
 control_chars = ''.join(map(unichr, range(0,32) + range(127,160)))
 control_char_re = re.compile('[%s]' % re.escape(control_chars))
 
+
 def remove_control_chars(s):
     return control_char_re.sub('', s)
+
 
 def http_emitter(message, log, agentConfig, endpoint):
     "Send payload"
@@ -36,7 +38,8 @@ def http_emitter(message, log, agentConfig, endpoint):
 
     zipped = zlib.compress(payload)
 
-    log.debug("payload_size=%d, compressed_size=%d, compression_ratio=%.3f" % (len(payload), len(zipped), float(len(payload))/float(len(zipped))))
+    log.debug("payload_size=%d, compressed_size=%d, compression_ratio=%.3f"
+              % (len(payload), len(zipped), float(len(payload))/float(len(zipped))))
 
     apiKey = message.get('apiKey', None)
     if not apiKey:
@@ -46,7 +49,7 @@ def http_emitter(message, log, agentConfig, endpoint):
 
     try:
         r = requests.post(url, data=zipped, timeout=10,
-            headers=post_headers(agentConfig, zipped))
+                          headers=post_headers(agentConfig, zipped))
 
         r.raise_for_status()
 
@@ -69,4 +72,3 @@ def post_headers(agentConfig, payload):
         'Accept': 'text/html, */*',
         'Content-MD5': md5(payload).hexdigest()
     }
-
