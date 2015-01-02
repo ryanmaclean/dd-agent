@@ -20,7 +20,7 @@ class NodeNotFound(Exception): pass
 class ElasticSearch(AgentCheck):
     SERVICE_CHECK_CONNECT_NAME = 'elasticsearch.can_connect'
     SERVICE_CHECK_CLUSTER_STATUS = 'elasticsearch.cluster_health'
-    
+
     METRICS = { # Metrics that are common to all Elasticsearch versions
         "elasticsearch.docs.count": ("gauge", "indices.docs.count"),
         "elasticsearch.docs.deleted": ("gauge", "indices.docs.deleted"),
@@ -155,6 +155,9 @@ class ElasticSearch(AgentCheck):
         # Check ES version for this instance and define parameters (URLs and metrics) accordingly
         version = self._get_es_version(config_url, auth)
         self._define_params(version)
+
+        # Collect metadata
+        self._collect_metadata(config_url, auth)
 
         # Load stats data.
         url = urlparse.urljoin(config_url, self.STATS_URL)
@@ -394,7 +397,7 @@ class ElasticSearch(AgentCheck):
         else:
             status = AgentCheck.CRITICAL
             tag = "ALERT"
-        
+
         msg = "{0} on cluster \"{1}\" | active_shards={2} | initializing_shards={3} | relocating_shards={4} | unassigned_shards={5} | timed_out={6}" \
                     .format(tag, data["cluster_name"],
                                  data["active_shards"],
@@ -436,4 +439,7 @@ class ElasticSearch(AgentCheck):
                  "event_object": hostname
             }
 
-
+    def _collect_metadata(self, config_url, auth):
+        metadata_dict = {}
+        metadata_dict['version'] = self._get_es_version(config_url, auth)
+        self.svc_metadata(metadata_dict)
