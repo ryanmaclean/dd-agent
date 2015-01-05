@@ -468,7 +468,7 @@ class Aggregator(object):
             # Event syntax:
             # _e{5,4}:title|body|meta
             name = name_and_metadata[0]
-            metadata = unicode(name_and_metadata[1])
+            metadata = name_and_metadata[1]
             title_length, text_length = name.split(',')
             title_length = int(title_length[3:])
             text_length = int(text_length[:-1])
@@ -498,6 +498,14 @@ class Aggregator(object):
             raise Exception(u'Unparseable event packet: %s' % packet)
 
     def submit_packets(self, packets):
+        # Usually we should always decode the string
+        # as utf-8 because `packets` passed through a
+        # network socket, but if submit_packets is used
+        # programatically and packets is unicode already
+        # then do not decode!
+        if not isinstance(packets, unicode):
+            packets = packets.decode('utf-8', 'replace')
+
         for packet in packets.splitlines():
 
             if not packet.strip():
