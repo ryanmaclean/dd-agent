@@ -533,12 +533,11 @@ class Aggregator(object):
             for m in meta.split('|'):
                 if m[0] == u'd':
                     service_check['timestamp'] = float(m[2:])
-                elif m[0] == u'i':
-                    service_check['check_run_id'] = int(m[2:])
                 elif m[0] == u'h':
                     service_check['hostname'] = m[2:]
                 elif m[0] == u'#':
                     service_check['tags'] = sorted(m[1:].split(u','))
+
             return service_check
 
         except IndexError, ValueError:
@@ -620,7 +619,7 @@ class Aggregator(object):
         self.events.append(event)
 
     def service_check(self, check_name, status, tags=None, timestamp=None,
-                      hostname=None, check_run_id=None, message=None):
+                      hostname=None, message=None):
         service_check = {
             'check': check_name,
             'status': status,
@@ -633,8 +632,6 @@ class Aggregator(object):
             service_check['host_name'] = hostname
         else:
             service_check['host_name'] = self.hostname
-        if check_run_id is not None:
-            service_check['check_run_id'] = check_run_id
         if message is not None:
             service_check['message'] = message
 
