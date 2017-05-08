@@ -1,3 +1,7 @@
+# (C) Datadog, Inc. 2010-2016
+# All rights reserved
+# Licensed under Simplified BSD License (see LICENSE)
+
 BASIC_METRICS = {
     'cpu.extra': {
         's_type'       : 'delta',
@@ -88,5 +92,29 @@ BASIC_METRICS = {
         'unit'         : 'kiloBytes',
         'rollup'       : 'average',
         'entity'       : ['VirtualMachine', 'HostSystem', 'ResourcePool']
+    },
+    'network.received': {
+        's_type'       : 'rate',
+        'unit'         : 'kiloBytesPerSecond',
+        'rollup'       : 'average',
+        'entity'       : ['VirtualMachine', 'HostSystem']
+    },
+    'network.transmitted': {
+        's_type'       : 'rate',
+        'unit'         : 'kiloBytesPerSecond',
+        'rollup'       : 'average',
+        'entity'       : ['VirtualMachine', 'HostSystem']
+    },
+    'net.received': {
+        's_type'       : 'rate',
+        'unit'         : 'kiloBytesPerSecond',
+        'rollup'       : 'average',
+        'entity'       : ['VirtualMachine', 'HostSystem']
+    },
+    'net.transmitted': {
+        's_type'       : 'rate',
+        'unit'         : 'kiloBytesPerSecond',
+        'rollup'       : 'average',
+        'entity'       : ['VirtualMachine', 'HostSystem']
     },
 }

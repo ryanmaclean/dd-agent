@@ -7,56 +7,75 @@
 
     Licensed under Simplified BSD License (see LICENSE)
     (C) Boxed Ice 2010 all rights reserved
-    (C) Datadog, Inc. 2010-2013 all rights reserved
+    (C) Datadog, Inc. 2010-2016 all rights reserved
 '''
-
 # set up logging before importing any other components
-from config import initialize_logging; initialize_logging('forwarder')
-from config import get_logging_config
+from config import initialize_logging  # noqa
+initialize_logging('forwarder')
 
-import os; os.umask(022)
-
-# Standard imports
+# stdlib
+import copy
+from datetime import timedelta
 import logging
 import os
+from Queue import Full, Queue
+from socket import error as socket_error, gaierror
 import sys
 import threading
+from urlparse import urlparse
 import zlib
-from Queue import Queue, Full
-from subprocess import Popen
-from hashlib import md5
-from datetime import datetime, timedelta
-from socket import gaierror, error as socket_error
 
-# Tornado
-import tornado.httpserver
-import tornado.ioloop
-import tornado.web
-from tornado.escape import json_decode
-from tornado.options import define, parse_command_line, options
+# For pickle & PID files, see issue 293
+os.umask(022)
 
-# agent import
-from util import Watchdog, get_uuid, get_hostname, json, get_tornado_ioloop
-from emitter import http_emitter
-from config import get_config
-from checks.check_status import ForwarderStatus
-from transaction import Transaction, TransactionManager
-import modules
-
-# 3rd party
+# 3p
+import simplejson as json
 try:
     import pycurl
 except ImportError:
     # For the source install, pycurl might not be installed
     pycurl = None
+from tornado.escape import json_decode
+import tornado.httpclient
+import tornado.httpserver
+import tornado.ioloop
+from tornado.options import define, options, parse_command_line
+import tornado.web
 
+# project
+from checks.check_status import ForwarderStatus
+from config import (
+    get_config,
+    get_logging_config,
+    get_url_endpoint,
+    get_version,
+    _is_affirmative
+)
+import modules
+from transaction import Transaction, TransactionManager
+from util import get_uuid
+from utils.net import DEFAULT_DNS_TTL, DNSCache
+
+
+
+from utils.hostname import get_hostname
+from utils.logger import RedactedLogRecord
+from utils.watchdog import Watchdog
+
+logging.LogRecord = RedactedLogRecord
 log = logging.getLogger('forwarder')
 log.setLevel(get_logging_config()['log_level'] or logging.INFO)
 
-DD_ENDPOINT  = "dd_url"
+DD_ENDPOINT = "dd_url"
 
-TRANSACTION_FLUSH_INTERVAL = 5000 # Every 5 seconds
-WATCHDOG_INTERVAL_MULTIPLIER = 10 # 10x flush interval
+# Transactions
+TRANSACTION_FLUSH_INTERVAL = 5000  # Every 5 seconds
+
+# Watchdog settings
+WATCHDOG_INTERVAL_MULTIPLIER = 10  # 10x flush interval
+WATCHDOG_HIGH_ACTIVITY_THRESHOLD = 1000  # Threshold to detect pathological activity
+
+# Misc
 HEADERS_TO_REMOVE = [
     'Host',
     'Content-Length',
@@ -67,9 +86,13 @@ HEADERS_TO_REMOVE = [
 MAX_WAIT_FOR_REPLAY = timedelta(seconds=90)
 
 # Maximum queue size in bytes (when this is reached, old messages are dropped)
-MAX_QUEUE_SIZE = 30 * 1024 * 1024 # 30MB
+MAX_QUEUE_SIZE = 30 * 1024 * 1024  # 30MB
 
-THROTTLING_DELAY = timedelta(microseconds=1000000/2) # 2 msg/second
+# Some responses should be rejected, rather than replayed. This list will be rejected.
+RESPONSES_TO_REJECT = [413, 400]
+
+THROTTLING_DELAY = timedelta(microseconds=1000000 / 2)  # 2 msg/second
+
 
 class EmitterThread(threading.Thread):
 
@@ -98,6 +121,7 @@ class EmitterThread(threading.Thread):
         except Full:
             self.__logger.warn('Dropping packet for %r due to backlog', self.__name)
 
+
 class EmitterManager(object):
     """Track custom emitters"""
 
@@ -105,7 +129,8 @@ class EmitterManager(object):
         self.agentConfig = config
         self.emitterThreads = []
         for emitter_spec in [s.strip() for s in self.agentConfig.get('custom_emitters', '').split(',')]:
-            if len(emitter_spec) == 0: continue
+            if len(emitter_spec) == 0:
+                continue
             logging.info('Setting up custom emitter %r', emitter_spec)
             try:
                 thread = EmitterThread(
@@ -116,13 +141,13 @@ class EmitterManager(object):
                 )
                 thread.start()
                 self.emitterThreads.append(thread)
-            except Exception, e:
+            except Exception:
                 logging.error('Unable to start thread for emitter: %r', emitter_spec, exc_info=True)
         logging.info('Done with custom emitters')
 
     def send(self, data, headers=None):
         if not self.emitterThreads:
-            return # bypass decompression/decoding
+            return  # bypass decompression/decoding
         if headers and headers.get('Content-Encoding') == 'deflate':
             data = zlib.decompress(data)
         data = json_decode(data)
@@ -130,12 +155,14 @@ class EmitterManager(object):
             logging.info('Queueing for emitter %r', emitterThread.name)
             emitterThread.enqueue(data, headers)
 
-class MetricTransaction(Transaction):
 
+class AgentTransaction(Transaction):
     _application = None
     _trManager = None
-    _endpoints = []
+    _endpoints = {}
     _emitter_manager = None
+    _type = None
+    _request_timeout = 20
 
     @classmethod
     def set_application(cls, app):
@@ -147,28 +174,22 @@ class MetricTransaction(Transaction):
         cls._trManager = manager
 
     @classmethod
+    def set_endpoints(cls, endpoints):
+        cls._endpoints = endpoints
+
+    @classmethod
+    def set_request_timeout(cls, request_timeout):
+        cls._request_timeout = request_timeout
+
+    @classmethod
     def get_tr_manager(cls):
         return cls._trManager
 
-    @classmethod
-    def set_endpoints(cls):
-
-        # Only send data to Datadog if an API KEY exists
-        # i.e. user is also Datadog user
-        try:
-            is_dd_user = 'api_key' in cls._application._agentConfig\
-                and 'use_dd' in cls._application._agentConfig\
-                and cls._application._agentConfig['use_dd']\
-                and cls._application._agentConfig.get('api_key')
-            if is_dd_user:
-                log.warn("You are a Datadog user so we will send data to https://app.datadoghq.com")
-                cls._endpoints.append(DD_ENDPOINT)
-        except Exception:
-            log.info("Not a Datadog user")
-
-    def __init__(self, data, headers):
+    def __init__(self, data, headers, msg_type=""):
         self._data = data
         self._headers = headers
+        self._headers['DD-Forwarder-Version'] = get_version()
+        self._msg_type = msg_type
 
         # Call after data has been set (size is computed in Transaction's init)
         Transaction.__init__(self)
@@ -177,97 +198,122 @@ class MetricTransaction(Transaction):
         if self._emitter_manager is not None:
             self._emitter_manager.send(data, headers)
 
-        # Insert the transaction in the Manager
-        self._trManager.append(self)
-        log.debug("Created transaction %d" % self.get_id())
+        # Insert the transaction(s) in the Manager
+        for endpoint in self._endpoints:
+            for api_key in self._endpoints[endpoint]:
+                transaction = copy.copy(self)
+                transaction._endpoint = endpoint
+                transaction._api_key = api_key
+                self._trManager.append(transaction)
+                log.debug("Created transaction %d" % transaction.get_id())
         self._trManager.flush()
 
     def __sizeof__(self):
         return sys.getsizeof(self._data)
 
-    def get_url(self, endpoint):
-        api_key = self._application._agentConfig.get('api_key')
-        if api_key:
-            return self._application._agentConfig[endpoint] + '/intake?api_key=%s' % api_key
-        return self._application._agentConfig[endpoint] + '/intake'
+    def get_url(self, endpoint, api_key):
+        endpoint_base_url = get_url_endpoint(endpoint)
+        if self._application.agent_dns_caching:
+            endpoint_base_url = self._application.get_from_dns_cache(endpoint_base_url)
+        return "{0}/intake/{1}?api_key={2}".format(endpoint_base_url, self._msg_type, api_key)
 
     def flush(self):
-        for endpoint in self._endpoints:
-            url = self.get_url(endpoint)
-            log.debug("Sending metrics to endpoint %s at %s" % (endpoint, url))
+        # Getting proxy settings
+        proxy_settings = self._application._agentConfig.get('proxy_settings', None)
 
-            # Getting proxy settings
-            proxy_settings = self._application._agentConfig.get('proxy_settings', None)
+        tornado_client_params = {
+            'method': 'POST',
+            'body': self._data,
+            'headers': self._headers,
+            'validate_cert': not self._application.skip_ssl_validation,
+            'allow_ipv6': True,
+            'request_timeout': self._request_timeout,
+        }
 
-            tornado_client_params = {
-                'url': url,
-                'method': 'POST',
-                'body': self._data,
-                'headers': self._headers,
-                'validate_cert': not self._application.skip_ssl_validation,
-            }
+        # Remove headers that were passed by the emitter. Those don't apply anymore
+        # This is pretty hacky though as it should be done in pycurl or curl or tornado
+        for h in HEADERS_TO_REMOVE:
+            if h in tornado_client_params['headers']:
+                del tornado_client_params['headers'][h]
+                log.debug("Removing {0} header.".format(h))
 
-            # Remove headers that were passed by the emitter. Those don't apply anymore
-            # This is pretty hacky though as it should be done in pycurl or curl or tornado
-            for h in HEADERS_TO_REMOVE:
-                if h in tornado_client_params['headers']:
-                    del tornado_client_params['headers'][h]
-                    log.debug("Removing {0} header.".format(h))
+        force_use_curl = False
 
-            force_use_curl = False
+        if proxy_settings is not None:
+            force_use_curl = True
+            if pycurl is not None:
+                log.debug("Configuring tornado to use proxy settings: %s:****@%s:%s" % (proxy_settings['user'],
+                          proxy_settings['host'], proxy_settings['port']))
+                tornado_client_params['proxy_host'] = proxy_settings['host']
+                tornado_client_params['proxy_port'] = proxy_settings['port']
+                tornado_client_params['proxy_username'] = proxy_settings['user']
+                tornado_client_params['proxy_password'] = proxy_settings['password']
 
-            if proxy_settings is not None:
-                force_use_curl = True
-                if pycurl is not None:
-                    log.debug("Configuring tornado to use proxy settings: %s:****@%s:%s" % (proxy_settings['user'],
-                        proxy_settings['host'], proxy_settings['port']))
-                    tornado_client_params['proxy_host'] = proxy_settings['host']
-                    tornado_client_params['proxy_port'] = proxy_settings['port']
-                    tornado_client_params['proxy_username'] = proxy_settings['user']
-                    tornado_client_params['proxy_password'] = proxy_settings['password']
+                if self._application._agentConfig.get('proxy_forbid_method_switch'):
+                    # See http://stackoverflow.com/questions/8156073/curl-violate-rfc-2616-10-3-2-and-switch-from-post-to-get
+                    tornado_client_params['prepare_curl_callback'] = lambda curl: curl.setopt(pycurl.POSTREDIR, pycurl.REDIR_POST_ALL)
 
-                    if self._application._agentConfig.get('proxy_forbid_method_switch'):
-                        # See http://stackoverflow.com/questions/8156073/curl-violate-rfc-2616-10-3-2-and-switch-from-post-to-get
-                        tornado_client_params['prepare_curl_callback'] = lambda curl: curl.setopt(pycurl.POSTREDIR, pycurl.REDIR_POST_ALL)
-                
-            if (not self._application.use_simple_http_client or force_use_curl) and pycurl is not None:
-                ssl_certificate = self._application._agentConfig.get('ssl_certificate', None)
-                tornado_client_params['ca_certs'] = ssl_certificate
+        if (not self._application.use_simple_http_client or force_use_curl) and pycurl is not None:
+            ssl_certificate = self._application._agentConfig.get('ssl_certificate', None)
+            tornado_client_params['ca_certs'] = ssl_certificate
 
-            req = tornado.httpclient.HTTPRequest(**tornado_client_params)
-            use_curl = force_use_curl or self._application._agentConfig.get("use_curl_http_client") and not self._application.use_simple_http_client
-            
-            if use_curl:
-                if pycurl is None:
-                    log.error("dd-agent is configured to use the Curl HTTP Client, but pycurl is not available on this system.")
-                else:
-                    log.debug("Using CurlAsyncHTTPClient")
-                    tornado.httpclient.AsyncHTTPClient.configure("tornado.curl_httpclient.CurlAsyncHTTPClient")
+        use_curl = force_use_curl or self._application._agentConfig.get("use_curl_http_client") and not self._application.use_simple_http_client
+
+        if use_curl:
+            if pycurl is None:
+                log.error("dd-agent is configured to use the Curl HTTP Client, but pycurl is not available on this system.")
             else:
-                log.debug("Using SimpleHTTPClient")
-            http = tornado.httpclient.AsyncHTTPClient()
-            http.fetch(req, callback=self.on_response)
+                log.debug("Using CurlAsyncHTTPClient")
+                tornado.httpclient.AsyncHTTPClient.configure("tornado.curl_httpclient.CurlAsyncHTTPClient")
+        else:
+            log.debug("Using SimpleHTTPClient")
+        http = tornado.httpclient.AsyncHTTPClient()
+
+        url = self.get_url(self._endpoint, self._api_key)
+        log.debug(
+            u"Sending %s to endpoint %s at %s",
+            self._type, self._endpoint, url
+        )
+        req = tornado.httpclient.HTTPRequest(url=url, **tornado_client_params)
+        http.fetch(req, callback=self.on_response)
 
     def on_response(self, response):
         if response.error:
             log.error("Response: %s" % response)
-            self._trManager.tr_error(self)
+            if response.code in RESPONSES_TO_REJECT:
+                self._trManager.tr_error_reject_request(self)
+            else:
+                self._trManager.tr_error(self)
         else:
             self._trManager.tr_success(self)
 
         self._trManager.flush_next()
 
 
+class MetricTransaction(AgentTransaction):
+    _type = "metrics"
+
+
 class APIMetricTransaction(MetricTransaction):
 
-    def get_url(self, endpoint):
-        config = self._application._agentConfig
-        api_key = config['api_key']
-        url = config[endpoint] + '/api/v1/series/?api_key=' + api_key
-        return url
+    def get_url(self, endpoint, api_key):
+        endpoint_base_url = get_url_endpoint(endpoint)
+        if self._application.agent_dns_caching:
+            endpoint_base_url = self._application.get_from_dns_cache(endpoint_base_url)
+        return "{0}/api/v1/series/?api_key={1}".format(endpoint_base_url, api_key)
 
     def get_data(self):
         return self._data
+
+
+class APIServiceCheckTransaction(AgentTransaction):
+    _type = "service checks"
+
+    def get_url(self, endpoint, api_key):
+        endpoint_base_url = get_url_endpoint(endpoint)
+        if self._application.agent_dns_caching:
+            endpoint_base_url = self._application.get_from_dns_cache(endpoint_base_url)
+        return "{0}/api/v1/check_run/?api_key={1}".format(endpoint_base_url, api_key)
 
 
 class StatusHandler(tornado.web.RequestHandler):
@@ -288,7 +334,9 @@ class StatusHandler(tornado.web.RequestHandler):
             if len(transactions) > threshold:
                 self.set_status(503)
 
+
 class AgentInputHandler(tornado.web.RequestHandler):
+    _MSG_TYPE = ""
 
     def post(self):
         """Read the message and forward it to the intake"""
@@ -296,14 +344,24 @@ class AgentInputHandler(tornado.web.RequestHandler):
         # read message
         msg = self.request.body
         headers = self.request.headers
+        msg_type = self._MSG_TYPE
 
         if msg is not None:
             # Setup a transaction for this message
-            tr = MetricTransaction(msg, headers)
+            tr = MetricTransaction(msg, headers, msg_type)
         else:
             raise tornado.web.HTTPError(500)
 
         self.write("Transaction: %s" % tr.get_id())
+
+
+class MetricsAgentInputHandler(AgentInputHandler):
+    _MSG_TYPE = "metrics"
+
+
+class MetadataAgentInputHandler(AgentInputHandler):
+    _MSG_TYPE = "metadata"
+
 
 class ApiInputHandler(tornado.web.RequestHandler):
 
@@ -316,33 +374,83 @@ class ApiInputHandler(tornado.web.RequestHandler):
 
         if msg is not None:
             # Setup a transaction for this message
-            tr = APIMetricTransaction(msg, headers)
+            APIMetricTransaction(msg, headers)
         else:
             raise tornado.web.HTTPError(500)
 
 
+class ApiCheckRunHandler(tornado.web.RequestHandler):
+    """
+    Handler to submit Service Checks
+    """
+    def post(self):
+        # read message
+        msg = self.request.body
+        headers = self.request.headers
+
+        if msg is not None:
+            # Setup a transaction for this message
+            tr = APIServiceCheckTransaction(msg, headers)
+        else:
+            raise tornado.web.HTTPError(500)
+
+        self.write("Transaction: %s" % tr.get_id())
+
+
 class Application(tornado.web.Application):
 
-    def __init__(self, port, agentConfig, watchdog=True, skip_ssl_validation=False, use_simple_http_client=False):
+    NO_PARALLELISM = 1
+    DEFAULT_PARALLELISM = 5
+
+    def __init__(self, port, agentConfig, watchdog=True,
+                 skip_ssl_validation=False, use_simple_http_client=False):
         self._port = int(port)
         self._agentConfig = agentConfig
         self._metrics = {}
-        MetricTransaction.set_application(self)
-        MetricTransaction.set_endpoints()
+        self._dns_cache = None
+        AgentTransaction.set_application(self)
+        AgentTransaction.set_endpoints(agentConfig['endpoints'])
+        if agentConfig['endpoints'] == {}:
+            log.warning(u"No valid endpoint found. Forwarder will drop all incoming payloads.")
+        AgentTransaction.set_request_timeout(agentConfig['forwarder_timeout'])
+
+        max_parallelism = self.NO_PARALLELISM
+        # Multiple endpoints => enable parallelism
+        if len(agentConfig['endpoints']) > 1:
+            max_parallelism = self.DEFAULT_PARALLELISM
+
         self._tr_manager = TransactionManager(MAX_WAIT_FOR_REPLAY,
-            MAX_QUEUE_SIZE, THROTTLING_DELAY)
-        MetricTransaction.set_tr_manager(self._tr_manager)
+                                              MAX_QUEUE_SIZE, THROTTLING_DELAY,
+                                              max_parallelism=max_parallelism)
+        AgentTransaction.set_tr_manager(self._tr_manager)
 
         self._watchdog = None
-        self.skip_ssl_validation = skip_ssl_validation or agentConfig.get('skip_ssl_validation', False)
+        self.skip_ssl_validation = skip_ssl_validation or _is_affirmative(agentConfig.get('skip_ssl_validation'))
+        self.agent_dns_caching = _is_affirmative(agentConfig.get('dns_caching'))
+        self.agent_dns_ttl = int(agentConfig.get('dns_ttl', DEFAULT_DNS_TTL))
+        if self.agent_dns_caching:
+            self._dns_cache = DNSCache(ttl=self.agent_dns_ttl)
         self.use_simple_http_client = use_simple_http_client
         if self.skip_ssl_validation:
             log.info("Skipping SSL hostname validation, useful when using a transparent proxy")
 
+        # Monitor activity
         if watchdog:
-            watchdog_timeout = TRANSACTION_FLUSH_INTERVAL * WATCHDOG_INTERVAL_MULTIPLIER
-            self._watchdog = Watchdog(watchdog_timeout,
-                max_mem_mb=agentConfig.get('limit_memory_consumption', None))
+            watchdog_timeout = TRANSACTION_FLUSH_INTERVAL * WATCHDOG_INTERVAL_MULTIPLIER / 1000
+            self._watchdog = Watchdog.create(watchdog_timeout,
+                                             max_resets=WATCHDOG_HIGH_ACTIVITY_THRESHOLD)
+
+
+    def get_from_dns_cache(self, url):
+        if not self.agent_dns_caching:
+            log.debug('Caching disabled, not resolving.')
+            return url
+
+        location = urlparse(url)
+        resolve = self._dns_cache.resolve(location.netloc)
+        return "{scheme}://{ip}".format(scheme=location.scheme,
+                                        ip=resolve)
+
 
     def log_request(self, handler):
         """ Override the tornado logging method.
@@ -354,19 +462,23 @@ class Application(tornado.web.Application):
             log_method = log.warning
         else:
             log_method = log.error
+
         request_time = 1000.0 * handler.request.request_time()
-        log_method("%d %s %.2fms", handler.get_status(),
-                   handler._request_summary(), request_time)
+        log_method(
+            u"%d %s %.2fms",
+            handler.get_status(),
+            handler._request_summary(), request_time
+        )
 
     def appendMetric(self, prefix, name, host, device, ts, value):
 
-        if self._metrics.has_key(prefix):
+        if prefix in self._metrics:
             metrics = self._metrics[prefix]
         else:
             metrics = {}
             self._metrics[prefix] = metrics
 
-        if metrics.has_key(name):
+        if name in metrics:
             metrics[name].append([host, device, ts, value])
         else:
             metrics[name] = [[host, device, ts, value]]
@@ -378,13 +490,16 @@ class Application(tornado.web.Application):
             self._metrics['internalHostname'] = get_hostname(self._agentConfig)
             self._metrics['apiKey'] = self._agentConfig['api_key']
             MetricTransaction(json.dumps(self._metrics),
-                headers={'Content-Type': 'application/json'})
+                              headers={'Content-Type': 'application/json'})
             self._metrics = {}
 
     def run(self):
         handlers = [
             (r"/intake/?", AgentInputHandler),
+            (r"/intake/metrics?", MetricsAgentInputHandler),
+            (r"/intake/metadata?", MetadataAgentInputHandler),
             (r"/api/v1/series/?", ApiInputHandler),
+            (r"/api/v1/check_run/?", ApiCheckRunHandler),
             (r"/status/?", StatusHandler),
         ]
 
@@ -407,27 +522,27 @@ class Application(tornado.web.Application):
             else:
                 # localhost in lieu of 127.0.0.1 to support IPv6
                 try:
-                    http_server.listen(self._port, address = self._agentConfig['bind_host'])
+                    http_server.listen(self._port, address=self._agentConfig['bind_host'])
                 except gaierror:
                     log.warning("localhost seems undefined in your host file, using 127.0.0.1 instead")
-                    http_server.listen(self._port, address = "127.0.0.1")
-                except socket_error, e:
+                    http_server.listen(self._port, address="127.0.0.1")
+                except socket_error as e:
                     if "Errno 99" in str(e):
                         log.warning("IPv6 doesn't seem to be fully supported. Falling back to IPv4")
-                        http_server.listen(self._port, address = "127.0.0.1")
+                        http_server.listen(self._port, address="127.0.0.1")
                     else:
                         raise
-        except socket_error, e:
+        except socket_error as e:
             log.exception("Socket error %s. Is another application listening on the same port ? Exiting", e)
             sys.exit(1)
-        except Exception, e:
+        except Exception as e:
             log.exception("Uncaught exception. Forwarder is exiting.")
             sys.exit(1)
 
         log.info("Listening on port %d" % self._port)
 
         # Register callbacks
-        self.mloop = get_tornado_ioloop()
+        self.mloop = tornado.ioloop.IOLoop.current()
 
         logging.getLogger().setLevel(get_logging_config()['log_level'] or logging.INFO)
 
@@ -437,8 +552,8 @@ class Application(tornado.web.Application):
             self._postMetrics()
             self._tr_manager.flush()
 
-        tr_sched = tornado.ioloop.PeriodicCallback(flush_trs,TRANSACTION_FLUSH_INTERVAL,
-            io_loop = self.mloop)
+        tr_sched = tornado.ioloop.PeriodicCallback(flush_trs, TRANSACTION_FLUSH_INTERVAL,
+                                                   io_loop=self.mloop)
 
         # Register optional Graphite listener
         gport = self._agentConfig.get("graphite_listen_port", None)
@@ -449,7 +564,7 @@ class Application(tornado.web.Application):
             if non_local_traffic is True:
                 gs.listen(gport)
             else:
-                gs.listen(gport, address = "localhost")
+                gs.listen(gport, address="localhost")
 
         # Start everything
         if self._watchdog:
@@ -462,8 +577,9 @@ class Application(tornado.web.Application):
     def stop(self):
         self.mloop.stop()
 
+
 def init(skip_ssl_validation=False, use_simple_http_client=False):
-    agentConfig = get_config(parse_args = False)
+    agentConfig = get_config(parse_args=False)
 
     port = agentConfig.get('listen_port', 17123)
     if port is None:
@@ -483,6 +599,7 @@ def init(skip_ssl_validation=False, use_simple_http_client=False):
 
     return app
 
+
 def main():
     define("sslcheck", default=1, help="Verify SSL hostname, on by default")
     define("use_simple_http_client", default=0, help="Use Tornado SimpleHTTPClient instead of CurlAsyncHTTPClient")
@@ -498,7 +615,6 @@ def main():
 
     # If we don't have any arguments, run the server.
     if not args:
-        import tornado.httpclient
         app = init(skip_ssl_validation, use_simple_http_client=use_simple_http_client)
         try:
             app.run()
@@ -508,8 +624,7 @@ def main():
             ForwarderStatus.remove_latest_status()
 
     else:
-        usage = "%s [help|info]. Run with no commands to start the server" % (
-                                        sys.argv[0])
+        usage = "%s [help|info]. Run with no commands to start the server" % (sys.argv[0])
         command = args[0]
         if command == 'info':
             logging.getLogger().setLevel(logging.ERROR)

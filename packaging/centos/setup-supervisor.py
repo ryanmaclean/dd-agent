@@ -1,7 +1,11 @@
-#! /usr/bin/python
+# (C) Datadog, Inc. 2010-2016
+# All rights reserved
+# Licensed under Simplified BSD License (see LICENSE)
 
-import sys
+#! /usr/bin/python
 import ConfigParser
+import sys
+
 
 def main():
 

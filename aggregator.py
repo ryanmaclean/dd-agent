@@ -1,8 +1,13 @@
+# (C) Datadog, Inc. 2010-2016
+# All rights reserved
+# Licensed under Simplified BSD License (see LICENSE)
+
+# stdlib
 import logging
 from time import time
 
+# project
 from checks.metric_types import MetricTypes
-from config import get_histogram_aggregates, get_histogram_percentiles
 
 log = logging.getLogger(__name__)
 
@@ -18,8 +23,13 @@ log = logging.getLogger(__name__)
 # MetricsBucketAggregator constructor.
 RECENT_POINT_THRESHOLD_DEFAULT = 3600
 
-class Infinity(Exception): pass
-class UnknownValue(Exception): pass
+
+class Infinity(Exception):
+    pass
+
+
+class UnknownValue(Exception):
+    pass
 
 
 class Metric(object):
@@ -248,13 +258,15 @@ class Histogram(Metric):
         min_ = self.samples[0]
         max_ = self.samples[-1]
         med = self.samples[int(round(length/2 - 1))]
-        avg = sum(self.samples) / float(length)
+        sum_ = sum(self.samples)
+        avg = sum_ / float(length)
 
         aggregators = [
             ('min', min_, MetricTypes.GAUGE),
             ('max', max_, MetricTypes.GAUGE),
             ('median', med, MetricTypes.GAUGE),
             ('avg', avg, MetricTypes.GAUGE),
+            ('sum', sum_, MetricTypes.GAUGE),
             ('count', self.count/interval, MetricTypes.RATE),
         ]
 
@@ -265,15 +277,14 @@ class Histogram(Metric):
         ]
 
         metrics = [self.formatter(
-                hostname=self.hostname,
-                device_name=self.device_name,
-                tags=self.tags,
-                metric='%s.%s' % (self.name, suffix),
-                value=value,
-                timestamp=ts,
-                metric_type=metric_type,
-                interval=interval,
-            ) for suffix, value, metric_type in metric_aggrs
+            hostname=self.hostname,
+            device_name=self.device_name,
+            tags=self.tags,
+            metric='%s.%s' % (self.name, suffix),
+            value=value,
+            timestamp=ts,
+            metric_type=metric_type,
+            interval=interval) for suffix, value, metric_type in metric_aggrs
         ]
 
         for p in self.percentiles:
@@ -432,7 +443,7 @@ class Aggregator(object):
         name_and_metadata = packet.split(':', 1)
 
         if len(name_and_metadata) != 2:
-            raise Exception('Unparseable metric packet: %s' % packet)
+            raise Exception(u'Unparseable metric packet: %s' % packet)
 
         name = name_and_metadata[0]
         broken_split = name_and_metadata[1].split(':')
@@ -453,7 +464,7 @@ class Aggregator(object):
             value_and_metadata = datum.split('|')
 
             if len(value_and_metadata) < 2:
-                raise Exception('Unparseable metric packet: %s' % packet)
+                raise Exception(u'Unparseable metric packet: %s' % packet)
 
             # Submit the metric
             raw_value = value_and_metadata[0]
@@ -471,21 +482,25 @@ class Aggregator(object):
                         value = float(raw_value)
                     except ValueError:
                         # Otherwise, raise an error saying it must be a number
-                        raise Exception('Metric value must be a number: %s, %s' % (name, raw_value))
-
+                        raise Exception(u'Metric value must be a number: %s, %s' % (name, raw_value))
 
             # Parse the optional values - sample rate & tags.
             sample_rate = 1
             tags = None
-            for m in value_and_metadata[2:]:
-                # Parse the sample rate
-                if m[0] == '@':
-                    sample_rate = float(m[1:])
-                    assert 0 <= sample_rate <= 1
-                elif m[0] == '#':
-                    tags = tuple(sorted(m[1:].split(',')))
+            try:
+                for m in value_and_metadata[2:]:
+                    # Parse the sample rate
+                    if m[0] == '@':
+                        sample_rate = float(m[1:])
+                        # in case it's in a bad state
+                        sample_rate = 1 if sample_rate < 0 or sample_rate > 1 else sample_rate
+                    elif m[0] == '#':
+                        tags = tuple(sorted(m[1:].split(',')))
+            except IndexError:
+                log.warning(u'Incorrect metric metadata: metric_name:%s, metadata:%s',
+                            name, u' '.join(value_and_metadata[2:]))
 
-            parsed_packets.append((name, value, metric_type, tags,sample_rate))
+            parsed_packets.append((name, value, metric_type, tags, sample_rate))
 
         return parsed_packets
 
@@ -549,7 +564,7 @@ class Aggregator(object):
                 'status': int(status)
             }
 
-            message_delimiter = '|m:' if '|m:' in metadata else 'm:'
+            message_delimiter = 'm:' if metadata.startswith('m:') else '|m:'
             if message_delimiter in metadata:
                 meta, message = metadata.rsplit(message_delimiter, 1)
                 service_check['message'] = self._unescape_sc_content(message)
@@ -587,21 +602,20 @@ class Aggregator(object):
                 continue
 
             if packet.startswith('_e'):
-                self.event_count += 1
                 event = self.parse_event_packet(packet)
                 self.event(**event)
+                self.event_count += 1
             elif packet.startswith('_sc'):
-                self.service_check_count += 1
                 service_check = self.parse_sc_packet(packet)
                 self.service_check(**service_check)
+                self.service_check_count += 1
             else:
-                self.count += 1
                 parsed_packets = self.parse_metric_packet(packet)
+                self.count += 1
                 for name, value, mtype, tags, sample_rate in parsed_packets:
                     hostname, device_name, tags = self._extract_magic_tags(tags)
                     self.submit_metric(name, value, mtype, tags=tags, hostname=hostname,
-                        device_name=device_name, sample_rate=sample_rate)
-
+                                       device_name=device_name, sample_rate=sample_rate)
 
     def _extract_magic_tags(self, tags):
         """Magic tags (host, device) override metric hostname and device_name attributes"""
@@ -626,7 +640,7 @@ class Aggregator(object):
         return hostname, device_name, tags
 
     def submit_metric(self, name, value, mtype, tags=None, hostname=None,
-                                device_name=None, timestamp=None, sample_rate=1):
+                      device_name=None, timestamp=None, sample_rate=1):
         """ Add a metric to be aggregated """
         raise NotImplementedError()
 
@@ -740,7 +754,7 @@ class MetricsBucketAggregator(Aggregator):
         return timestamp - (timestamp % self.interval)
 
     def submit_metric(self, name, value, mtype, tags=None, hostname=None,
-                                device_name=None, timestamp=None, sample_rate=1):
+                      device_name=None, timestamp=None, sample_rate=1):
         # Avoid calling extra functions to dedupe tags if there are none
         # Note: if you change the way that context is created, please also change create_empty_metrics,
         #  which counts on this order
@@ -826,8 +840,8 @@ class MetricsBucketAggregator(Aggregator):
             # Even if there are no metrics in this flush, there may be some non-expired counters
             #  We should only create these non-expired metrics if we've passed an interval since the last flush
             if flush_cutoff_time >= self.last_flush_cutoff_time + self.interval:
-                self.create_empty_metrics(self.last_sample_time_by_context.copy(), expiry_timestamp, \
-                                                flush_cutoff_time-self.interval, metrics)
+                self.create_empty_metrics(self.last_sample_time_by_context.copy(), expiry_timestamp,
+                                          flush_cutoff_time-self.interval, metrics)
 
         # Log a warning regarding metrics with old timestamps being submitted
         if self.num_discarded_old_points > 0:
@@ -876,7 +890,7 @@ class MetricsAggregator(Aggregator):
         }
 
     def submit_metric(self, name, value, mtype, tags=None, hostname=None,
-                                device_name=None, timestamp=None, sample_rate=1):
+                      device_name=None, timestamp=None, sample_rate=1):
         # Avoid calling extra functions to dedupe tags if there are none
 
         # Keep hostname with empty string to unset it
@@ -949,20 +963,23 @@ class MetricsAggregator(Aggregator):
         return metrics
 
 def get_formatter(config):
-  formatter = api_formatter
+    formatter = api_formatter
 
-  if config['statsd_metric_namespace']:
-    def metric_namespace_formatter_wrapper(metric, value, timestamp, tags,
-        hostname=None, device_name=None, metric_type=None, interval=None):
-      metric_prefix = config['statsd_metric_namespace']
-      if metric_prefix[-1] != '.':
-        metric_prefix += '.'
+    if config['statsd_metric_namespace']:
+        def metric_namespace_formatter_wrapper(metric, value, timestamp, tags,
+                                               hostname=None, device_name=None,
+                                               metric_type=None, interval=None):
 
-      return api_formatter(metric_prefix + metric, value, timestamp, tags, hostname,
-        device_name, metric_type, interval)
+            metric_prefix = config['statsd_metric_namespace']
+            if metric_prefix[-1] != '.':
+                metric_prefix += '.'
 
-    formatter = metric_namespace_formatter_wrapper
-  return formatter
+            return api_formatter(metric_prefix + metric, value, timestamp, tags, hostname,
+                                 device_name, metric_type, interval)
+
+        formatter = metric_namespace_formatter_wrapper
+
+    return formatter
 
 
 def api_formatter(metric, value, timestamp, tags, hostname=None, device_name=None,

@@ -1,11 +1,20 @@
-import struct
-import logging
+# (C) Datadog, Inc. 2010-2016
+# All rights reserved
+# Licensed under Simplified BSD License (see LICENSE)
+
+# stdlib
 import cPickle as pickle
+import logging
+import struct
+
+# 3p
 from tornado.ioloop import IOLoop
 from tornado.tcpserver import TCPServer
 
-log = logging.getLogger(__name__)
+# project
+from utils.hostname import get_hostname
 
+log = logging.getLogger(__name__)
 
 
 class GraphiteServer(TCPServer):
@@ -38,7 +47,7 @@ class GraphiteConnection(object):
             size = struct.unpack("!L", data)[0]
             log.debug("Receiving a string of size:" + str(size))
             self.stream.read_bytes(size, self._on_read_line)
-        except Exception, e:
+        except Exception as e:
             log.error(e)
 
     def _on_read_line(self, data):
@@ -56,16 +65,16 @@ class GraphiteConnection(object):
         For instance, if the hostname is in 4th position,
         you could use: host = components[3]
         """
-        
+
         try:
-            components = metric.split('.')
+            components = metric.split('.') # NOQA
 
             host = self.hostname
             metric = metric
             device = "N/A"
-        
+
             return metric, host, device
-        except Exception, e:
+        except Exception:
             log.exception("Unparsable metric: %s" % metric)
             return None, None, None
 
@@ -82,7 +91,7 @@ class GraphiteConnection(object):
 
         log.debug("New metric: %s, values: %s" % (metric, datapoint))
         (metric, host, device) = self._parseMetric(metric)
-        if metric is not None:    
+        if metric is not None:
             self._postMetric(metric, host, device, datapoint)
             log.info("Posted metric: %s, host: %s, device: %s" % (metric, host, device))
 
@@ -93,20 +102,19 @@ class GraphiteConnection(object):
         except Exception:
             log.exception("Cannot decode grapite points")
             return
-   
+
         for (metric, datapoint) in datapoints:
             try:
                 datapoint = (float(datapoint[0]), float(datapoint[1]))
-            except Exception, e:
+            except Exception as e:
                 log.error(e)
                 continue
-            
+
             self._processMetric(metric, datapoint)
 
         self.stream.read_bytes(4, self._on_read_header)
 
 def start_graphite_listener(port):
-    from util import get_hostname
     echo_server = GraphiteServer(None, get_hostname(None))
     echo_server.listen(port)
     IOLoop.instance().start()

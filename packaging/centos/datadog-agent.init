@@ -25,36 +25,75 @@
 AGENTPATH="/opt/datadog-agent/agent/agent.py"
 AGENTCONF="/etc/dd-agent/datadog.conf"
 DOGSTATSDPATH="/opt/datadog-agent/agent/dogstatsd.py"
+KILL_PATH="/opt/datadog-agent/embedded/bin/kill"
 AGENTUSER="dd-agent"
 PIDPATH="/var/run/dd-agent/"
-FORWARDERPATH="/usr/bin/dd-forwarder"
+PROG="datadog-agent"
+LOCKFILE=/var/lock/subsys/$PROG
+FORWARDERPATH="/opt/datadog-agent/agent/ddagent.py"
+TRACEAGENTPATH="/opt/datadog-agent/bin/trace-agent"
 SUPERVISORD_PATH="PATH=/opt/datadog-agent/embedded/bin:/opt/datadog-agent/bin:$PATH /opt/datadog-agent/bin/supervisord"
 SUPERVISORCTL_PATH="/opt/datadog-agent/bin/supervisorctl"
 SUPERVISOR_CONF="/etc/dd-agent/supervisor.conf"
-SUPERVISOR_SOCK="/var/tmp/datadog-supervisor.sock"
+SUPERVISOR_SOCK="/opt/datadog-agent/run/datadog-supervisor.sock"
+SUPERVISOR_PIDFILE="/opt/datadog-agent/run/datadog-supervisord.pid"
+COLLECTOR_PIDFILE="/opt/datadog-agent/run/dd-agent.pid"
+
+# Captures processes in the supervisord group that are 'optional' i.e. not essential for the agent to run
+DD_OPT_PROC_REGEX="dogstatsd|jmxfetch|go-metro|trace-agent"
 
 # Source function library.
 . /etc/rc.d/init.d/functions
 
-PROG="datadog-agent"
-PIDFILE=$PIDPATH/$PROG.pid
-SUPERVISOR_PIDFILE=/var/run/datadog-supervisord.pid
-LOCKFILE=/var/lock/subsys/$PROG
 
 check_status() {
     # run checks to determine if the service is running or use generic status
+    QUERY="all"
+    if [ -n "$1" ] && [ "$1" != "all" ] && [ "$1" != "essential" ] && [ "$1" != "optional" ]; then
+        echo "Valid arguments for $0: all | essential | optional"
+    elif [ -n "$1" ]; then
+        QUERY=$1
+    fi
+
+    ESSENTIAL=0
+    OPTIONAL=0
+    FAIL=1
 
     # if the sock exists, we can use supervisorctl
     if [ -e $SUPERVISOR_SOCK ]; then
 
         s=`$SUPERVISORCTL_PATH -c $SUPERVISOR_CONF status`
 
-        # number of RUNNING supervisord programs (ignoring pup and dogstatsd)
-	p=`echo "$s" | grep -v dogstatsd | grep -c RUNNING`
+        # Number of RUNNING supervisord programs (ignoring optional procs captured by $DD_OPT_PROC_REGEX)
+        p=`echo "$s" | grep -Ev $DD_OPT_PROC_REGEX | grep -c RUNNING`
 
-        # number of expected running supervisord programs (ignoring pup and dogstatsd)
-	c=`grep -v dogstatsd $SUPERVISOR_CONF | grep -c '\[program:'`
+        # Number of non-failed OPTIONAL supervisord programs
+        p_o=`echo "$s" | grep -E $DD_OPT_PROC_REGEX | grep -cv FATAL`
+:
+        # Number of expected running supervisord programs (ignoring optional procs)
+        c=`grep -Ev $DD_OPT_PROC_REGEX $SUPERVISOR_CONF | grep -c '\[program:'`
+
+        # Number of expected optional supervisord programs
+        c_o=`grep -E $DD_OPT_PROC_REGEX $SUPERVISOR_CONF | grep -c '\[program:'`
+
         if [ "$p" -ne "$c" ]; then
+            ESSENTIAL=1
+
+        fi
+
+        if [ "$p_o" -ne "$c_o" ]; then
+            OPTIONAL=1
+        fi
+
+        if [ "$QUERY" = "essential" ] && [ "$ESSENTIAL" -eq 0 ]; then
+            FAIL=0
+        elif [ "$QUERY" = "optional" ] && [ "$OPTIONAL" -eq 0 ]; then
+            FAIL=0
+        elif [ "$QUERY" = "all" ] && [ "$ESSENTIAL" = "$OPTIONAL" ] && [ $ESSENTIAL -eq 0 ]; then
+            FAIL=0
+        fi
+
+        if [ "$FAIL" -gt 0 ]; then
             echo "$s"
             echo -n "Datadog Agent (supervisor) is NOT running all child processes"; failure; echo
             return 1
@@ -85,7 +124,7 @@ check_status() {
 }
 
 grab_status() {
-    GRABSTATUS=`check_status &>/dev/null`
+    GRABSTATUS=`check_status essential &>/dev/null`
 }
 
 start() {
@@ -94,7 +133,7 @@ start() {
         exit 3
     fi
 
-    su $AGENTUSER -c "$AGENTPATH configcheck" > /dev/null
+    su $AGENTUSER -c "$AGENTPATH configcheck" > /dev/null 2>&1
     if [ $? -ne 0 ]; then
         echo -n $'\n'"Invalid check configuration. Please run sudo /etc/init.d/datadog-agent configtest for more details."
         echo -n $'\n'"Resuming starting process."$'\n'
@@ -127,7 +166,7 @@ stop() {
     # it does the right thing. and testing supervisorctl status
     # before killproc can lead to states where you cannot stop!
     echo -n 'Stopping Datadog Agent (using killproc on supervisord): '
-    killproc -p $SUPERVISOR_PIDFILE
+    killproc -p $SUPERVISOR_PIDFILE -d 30
     rm -f $LOCKFILE
     echo
     return 0
@@ -148,7 +187,14 @@ info() {
     DOGSTATSD_RETURN=$?
     su $AGENTUSER -c "$FORWARDERPATH info"
     FORWARDER_RETURN=$?
-    exit $(($FORWARDER_RETURN+$COLLECTOR_RETURN+DOGSTATSD_RETURN))
+    su $AGENTUSER -c "$TRACEAGENTPATH -info"
+    TRACEAGENT_RETURN=$? # not used for now, Trace/APM not a core feature yet
+    exit $(($FORWARDER_RETURN+$COLLECTOR_RETURN+$DOGSTATSD_RETURN))
+}
+
+reload() {
+    $KILL_PATH -HUP `cat $COLLECTOR_PIDFILE`
+    exit $?
 }
 
 configcheck() {
@@ -161,18 +207,43 @@ case "$1" in
     start)
         start
         ;;
+
     stop)
         stop
         ;;
+
     restart)
         restart
         ;;
+
     status)
-        check_status
+        # Note: sh does not support arrays
+        # Check for kernel version 3.18+ - overlayfs has known bug affecting unix domain sockets
+        major=$(echo "$( uname -r )" | cut -d"." -f1)
+        minor=$(echo "$( uname -r )" | cut -d"." -f2)
+        # If major version 3, and minor version 18+, OR major version 4+
+        if ( [ $major -eq 3 ] && [ $minor -ge 18 ] ) || [ $major -gt 3 ]; then
+            RED='\033[0;31m' # Red Text
+            NC='\033[0m' # No Color
+            echo "${RED}Warning: Known bug in Linux Kernel 3.18+ causes 'status' to fail.${NC}"
+            echo "Calling 'info', instead..."
+            service datadog-agent info
+            if [ $? -ne 0 ]; then
+                exit 1
+            fi
+        else
+            check_status
+        fi
         ;;
+
     info)
         info "$@"
         ;;
+
+    reload)
+        reload
+        ;;
+
     configcheck)
         configcheck
         ;;
@@ -186,8 +257,15 @@ case "$1" in
         su $AGENTUSER -c "$AGENTPATH jmx $@"
         exit $?
         ;;
+
+    flare)
+        shift
+        $AGENTPATH flare $@
+        exit $?
+        ;;
+
     *)
-        echo "Usage: $0 {start|stop|restart|info|status|configcheck|configtest|jmx}"
+        echo "Usage: $0 {start|stop|restart|info|status|reload|configcheck|configtest|jmx}"
         exit 2
 esac
 exit $?

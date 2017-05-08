@@ -1,15 +1,17 @@
+# (C) Datadog, Inc. 2010-2016
+# All rights reserved
+# Licensed under Simplified BSD License (see LICENSE)
+
 # stdlib
 from collections import defaultdict
+from Queue import Empty, Queue
 import threading
 import time
-from Queue import Queue, Empty
 
 # project
-from config import _is_affirmative
 from checks import AgentCheck
-
-# 3rd party
 from checks.libs.thread_pool import Pool
+from config import _is_affirmative
 
 TIMEOUT = 180
 DEFAULT_SIZE_POOL = 6
@@ -19,7 +21,9 @@ FAILURE = "FAILURE"
 class Status:
     DOWN = "DOWN"
     WARNING = "WARNING"
+    CRITICAL = "CRITICAL"
     UP = "UP"
+
 
 class EventType:
     DOWN = "servicecheck.state_change.down"
@@ -29,12 +33,14 @@ class EventType:
 class NetworkCheck(AgentCheck):
     SOURCE_TYPE_NAME = 'servicecheck'
     SERVICE_CHECK_PREFIX = 'network_check'
+    _global_current_pool_size = 0
 
     STATUS_TO_SERVICE_CHECK = {
-            Status.UP  : AgentCheck.OK,
-            Status.WARNING : AgentCheck.WARNING,
-            Status.DOWN : AgentCheck.CRITICAL
-        }
+        Status.UP : AgentCheck.OK,
+        Status.WARNING : AgentCheck.WARNING,
+        Status.CRITICAL : AgentCheck.CRITICAL,
+        Status.DOWN : AgentCheck.CRITICAL,
+    }
 
     """
     Services checks inherits from this class.
@@ -62,18 +68,21 @@ class NetworkCheck(AgentCheck):
         self.statuses = {}
         self.notified = {}
         self.nb_failures = 0
+        self.pool_size = 0
         self.pool_started = False
 
         # Make sure every instance has a name that we use as a unique key
         # to keep track of statuses
         names = []
         for inst in instances:
-            if 'name' not in inst:
+            inst_name = inst.get('name', None)
+            if not inst_name:
                 raise Exception("All instances should have a 'name' parameter,"
                                 " error on instance: {0}".format(inst))
-            if inst['name'] in names:
+            if inst_name in names:
                 raise Exception("Duplicate names for instances with name {0}"
-                                .format(inst['name']))
+                                .format(inst_name))
+            names.append(inst_name)
 
     def stop(self):
         self.stop_pool()
@@ -87,14 +96,22 @@ class NetworkCheck(AgentCheck):
         default_size = min(self.instance_count(), DEFAULT_SIZE_POOL)
         self.pool_size = int(self.init_config.get('threads_count', default_size))
 
+        # To keep track on the total number of threads we should have running
+        NetworkCheck._global_current_pool_size += self.pool_size
+
         self.pool = Pool(self.pool_size)
 
         self.resultsq = Queue()
         self.jobs_status = {}
+        self.jobs_results = {}
         self.pool_started = True
 
     def stop_pool(self):
         self.log.info("Stopping Thread Pool")
+
+        # To keep track on the total number of threads we should have running
+        NetworkCheck._global_current_pool_size -= self.pool_size
+
         if self.pool_started:
             self.pool.terminate()
             self.pool.join()
@@ -108,7 +125,8 @@ class NetworkCheck(AgentCheck):
     def check(self, instance):
         if not self.pool_started:
             self.start_pool()
-        if threading.activeCount() > 5 * self.pool_size + 5: # On Windows the agent runs on multiple threads so we need to have an offset of 5 in case the pool_size is 1
+        if threading.activeCount() > 5 * NetworkCheck._global_current_pool_size + 6:
+            # On Windows the agent runs on multiple threads because of WMI so we need an offset of 6
             raise Exception("Thread number (%s) is exploding. Skipping this check" % threading.activeCount())
         self._process_results()
         self._clean()
@@ -120,7 +138,7 @@ class NetworkCheck(AgentCheck):
         if name not in self.jobs_status:
             # A given instance should be processed one at a time
             self.jobs_status[name] = time.time()
-            self.pool.apply_async(self._process, args=(instance,))
+            self.jobs_results[name] = self.pool.apply_async(self._process, args=(instance,))
         else:
             self.log.error("Instance: %s skipped because it's already running." % name)
 
@@ -139,22 +157,29 @@ class NetworkCheck(AgentCheck):
                     self.resultsq.put((status, msg, sc_name, instance))
 
         except Exception:
-            result = (FAILURE, FAILURE, FAILURE, FAILURE)
+            self.log.exception(
+                u"Failed to process instance '%s'.", instance.get('Name', u"")
+            )
+            result = (FAILURE, FAILURE, FAILURE, instance)
             self.resultsq.put(result)
 
     def _process_results(self):
-        for i in range(MAX_LOOP_ITERATIONS):
+        for i in xrange(MAX_LOOP_ITERATIONS):
             try:
                 # We want to fetch the result in a non blocking way
                 status, msg, sc_name, instance = self.resultsq.get_nowait()
             except Empty:
                 break
 
+            instance_name = instance['name']
             if status == FAILURE:
                 self.nb_failures += 1
                 if self.nb_failures >= self.pool_size - 1:
                     self.nb_failures = 0
                     self.restart_pool()
+
+                # clean failed job
+                self._clean_job(instance_name)
                 continue
 
             self.report_as_service_check(sc_name, status, instance, msg)
@@ -163,7 +188,6 @@ class NetworkCheck(AgentCheck):
             # Don't create any event to avoid duplicates with server side
             # service_checks
             skip_event = _is_affirmative(instance.get('skip_event', False))
-            instance_name = instance['name']
             if not skip_event:
                 self.warning("Using events for service checks is deprecated in favor of monitors and will be removed in future versions of the Datadog Agent.")
                 event = None
@@ -198,9 +222,22 @@ class NetworkCheck(AgentCheck):
                 if event is not None:
                     self.events.append(event)
 
-            # The job is finished here, this instance can be re processed
-            if instance_name in self.jobs_status:
-                del self.jobs_status[instance_name]
+            self._clean_job(instance_name)
+
+    def _clean_job(self, instance_name):
+        # The job is finished here, this instance can be re processed
+        if instance_name in self.jobs_status:
+            self.log.debug("Instance: %s cleaned from jobs status." % instance_name)
+            del self.jobs_status[instance_name]
+
+        # if an exception happened, log it
+        if instance_name in self.jobs_results:
+            self.log.debug("Instance: %s cleaned from jobs results." % instance_name)
+            ret = self.jobs_results[instance_name].get()
+            if isinstance(ret, Exception):
+                self.log.exception("Exception in worker thread: {0}".format(ret))
+            del self.jobs_results[instance_name]
+
 
     def _check(self, instance):
         """This function should be implemented by inherited classes"""
@@ -209,8 +246,7 @@ class NetworkCheck(AgentCheck):
 
     def _clean(self):
         now = time.time()
-        for name in self.jobs_status.keys():
-            start_time = self.jobs_status[name]
+        for name, start_time in self.jobs_status.iteritems():
             if now - start_time > TIMEOUT:
                 self.log.critical("Restarting Pool. One check is stuck: %s" % name)
                 self.restart_pool()

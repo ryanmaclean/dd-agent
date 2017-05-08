@@ -1,21 +1,39 @@
-pymongo
+######################## WARNING ##########################
+# This file currently determines the python deps installed
+# for the dev env, the source install and the Win build.
+# It is also used as a constraint reference (`pip install -c`)
+# to avoid requirements from `integrations-core` overwrite
+# these when building official distribution packages,
+# (although versions should be aligned across repos).
+###########################################################
+
+###########################################################
+# These modules are the deps needed by the
+# agent core, meaning every module that is
+# not a check
+# They're installed in the CI and when doing
+# a source install
+# If their installation fails the agent installation
+# fails, so they shouldn't have too many deps
+###########################################################
+
+boto==2.46.1
+# utils/platform.py
+docker-py==1.10.6
+# utils/service_discovery/config_stores.py
+kazoo==2.2.1
+ntplib==0.3.3
+# utils/service_discovery/config_stores.py
+python-consul==0.4.7
+# utils/service_discovery/config_stores.py
+python-etcd==0.4.2
+# the libyaml bindings are optional
+pyyaml==3.11
+# note: requests is also used in many checks
+# upgrade with caution
+requests==2.11.1
+# note: simplejson is used in many checks to inteface APIs
+simplejson==3.6.5
+supervisor==3.3.0
 tornado==3.2.2
-redis
-python-memcached
-pyyaml
-simplejson
-psutil
-gearman
-pylint
-boto
-pycurl
-pysnmp
-pysnmp-mibs
-pymysql
-pyvmomi==5.5.0
-pg8000
-ntplib
-httplib2
-kafka-python==0.9.0-9bed11db98387c0d9e456528130b330631dc50af
-requests
-paramiko
+uptime==3.0.1

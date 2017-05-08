@@ -9,8 +9,10 @@ artifacts/*
 node_modules/*
 .DS_Store
 venv/*
+vendor/
 *.swp
 *.log
+!nagios.log
 *.pid
 *.deb
 *.rpm
@@ -30,3 +32,13 @@ Vagrantfile
 .vagrant/*
 embedded/*
 .pip-cache/*
+.cache
+dump.rdb
+tests/core/fixtures/flare/dd*
+.python-version
+.ropeproject
+.bundle
+tags
+
+checks.d
+conf.d

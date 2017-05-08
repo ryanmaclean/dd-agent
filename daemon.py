@@ -12,14 +12,18 @@
 
 # Core modules
 import atexit
+import errno
+import logging
 import os
+import signal
 import sys
 import time
-import logging
-import errno
-import signal
+
+# project
+from utils.process import is_my_process
 
 log = logging.getLogger(__name__)
+
 
 class AgentSupervisor(object):
     ''' A simple supervisor to keep a restart a child on expected auto-restarts
@@ -33,8 +37,6 @@ class AgentSupervisor(object):
             `child_func` is a function that should be run by the forked child
             that will auto-restart with the RESTART_EXIT_STATUS.
         '''
-        exit_code = cls.RESTART_EXIT_STATUS
-
         # Allow the child process to die on SIGTERM
         signal.signal(signal.SIGTERM, cls._handle_sigterm)
 
@@ -53,7 +55,6 @@ class AgentSupervisor(object):
                         if (cpid, status) != (0, 0):
                             break
                         time.sleep(1)
-                    exit_code = status >> 8
                     if parent_func is not None:
                         parent_func()
 
@@ -65,7 +66,7 @@ class AgentSupervisor(object):
                         child_func()
                     else:
                         break
-            except OSError, e:
+            except OSError as e:
                 msg = "Agent fork failed: %d (%s)" % (e.errno, e.strerror)
                 logging.error(msg)
                 sys.stderr.write(msg + "\n")
@@ -110,7 +111,7 @@ class Daemon(object):
             if pid > 0:
                 # Exit first parent
                 sys.exit(0)
-        except OSError, e:
+        except OSError as e:
             msg = "fork #1 failed: %d (%s)" % (e.errno, e.strerror)
             log.error(msg)
             sys.stderr.write(msg + "\n")
@@ -133,7 +134,7 @@ class Daemon(object):
                 if pid > 0:
                     # Exit from second parent
                     sys.exit(0)
-            except OSError, e:
+            except OSError as e:
                 msg = "fork #2 failed: %d (%s)" % (e.errno, e.strerror)
                 logging.error(msg)
                 sys.stderr.write(msg + "\n")
@@ -152,23 +153,25 @@ class Daemon(object):
 
         log.info("Daemon started")
 
-
     def start(self, foreground=False):
         log.info("Starting")
         pid = self.pid()
 
         if pid:
-            message = "pidfile %s already exists. Is it already running?\n"
-            log.error(message % self.pidfile)
-            sys.stderr.write(message % self.pidfile)
-            sys.exit(1)
+            # Check if the pid in the pidfile corresponds to a running process
+            # and if psutil is installed, check if it's a datadog-agent one
+            if is_my_process(pid):
+                log.error("Not starting, another instance is already running"
+                          " (using pidfile {0})".format(self.pidfile))
+                sys.exit(1)
+            else:
+                log.warn("pidfile doesn't contain the pid of an agent process."
+                         ' Starting normally')
 
-        log.info("Pidfile: %s" % self.pidfile)
         if not foreground:
             self.daemonize()
         self.write_pidfile()
         self.run()
-
 
     def stop(self):
         log.info("Stopping daemon")
@@ -191,7 +194,7 @@ class Daemon(object):
                     # No supervising process present
                     os.kill(pid, signal.SIGTERM)
                 log.info("Daemon is stopped")
-            except OSError, err:
+            except OSError as err:
                 if str(err).find("No such process") <= 0:
                     log.exception("Cannot kill Agent daemon at pid %s" % pid)
                     sys.stderr.write(str(err) + "\n")
@@ -206,12 +209,10 @@ class Daemon(object):
 
             return # Not an error in a restart
 
-
     def restart(self):
         "Restart the daemon"
         self.stop()
         self.start()
-
 
     def run(self):
         """
@@ -220,14 +221,13 @@ class Daemon(object):
         """
         raise NotImplementedError
 
-
-    def info(self):
+    @classmethod
+    def info(cls):
         """
         You should override this method when you subclass Daemon. It will be
         called to provide information about the status of the process
         """
         raise NotImplementedError
-
 
     def status(self):
         """
@@ -248,7 +248,7 @@ class Daemon(object):
                 # (from http://stackoverflow.com/questions/568271/check-if-pid-is-not-in-use-in-python,
                 #  Giampaolo's answer)
                 os.kill(pid, 0)
-            except OSError, e:
+            except OSError as e:
                 if e.errno != errno.EPERM:
                     message = '%s pidfile contains pid %s, but no running process could be found' % (self.__class__.__name__, pid)
                 else:
@@ -263,7 +263,6 @@ class Daemon(object):
         sys.stdout.write(message + "\n")
         sys.exit(exit_code)
 
-
     def pid(self):
         # Get the pid from the pidfile
         try:
@@ -276,7 +275,6 @@ class Daemon(object):
         except ValueError:
             return None
 
-
     def write_pidfile(self):
         # Write pidfile
         atexit.register(self.delpid) # Make sure pid file is removed if we quit
@@ -286,12 +284,11 @@ class Daemon(object):
             fp.write(str(pid))
             fp.close()
             os.chmod(self.pidfile, 0644)
-        except Exception, e:
+        except Exception:
             msg = "Unable to write pidfile: %s" % self.pidfile
             log.exception(msg)
             sys.stderr.write(msg + "\n")
             sys.exit(1)
-
 
     def delpid(self):
         try:

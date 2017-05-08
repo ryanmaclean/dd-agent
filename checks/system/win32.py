@@ -1,59 +1,98 @@
+# (C) Datadog, Inc. 2010-2016
+# All rights reserved
+# Licensed under Simplified BSD License (see LICENSE)
+
 # project
 from checks import Check
 
 # 3rd party
+import uptime
 try:
     import psutil
 except ImportError:
     psutil = None
 
 try:
-    import wmi
-    w = wmi.WMI()
+    from checks.libs.wmi.sampler import WMISampler
 except Exception:
-    wmi, w = None, None
+    def WMISampler(*args, **kwargs):
+        """
+        Fallback with a 'None' callable object.
+        """
+        return
+
+# datadog
+from utils.timeout import TimeoutException
+
 
 # Device WMI drive types
 class DriveType(object):
     UNKNOWN, NOROOT, REMOVEABLE, LOCAL, NETWORK, CD, RAM = (0, 1, 2, 3, 4, 5, 6)
-B2MB  = float(1048576)
+B2MB = float(1048576)
 KB2MB = B2KB = float(1024)
+
 
 def should_ignore_disk(name, blacklist_re):
     # blacklist_re is a compiled regex, compilation done at config loading time
-    return name =='_total' or blacklist_re is not None and blacklist_re.match(name)
+    return name == '_total' or blacklist_re is not None and blacklist_re.match(name)
+
 
 class Processes(Check):
     def __init__(self, logger):
         Check.__init__(self, logger)
+
+        # Sampler(s)
+        self.wmi_sampler = WMISampler(
+            logger,
+            "Win32_PerfRawData_PerfOS_System",
+            ["ProcessorQueueLength", "Processes"]
+        )
+
         self.gauge('system.proc.queue_length')
         self.gauge('system.proc.count')
 
     def check(self, agentConfig):
         try:
-            os = w.Win32_PerfFormattedData_PerfOS_System()[0]
-        except AttributeError:
-            self.logger.info('Missing Win32_PerfFormattedData_PerfOS_System WMI class.' \
-                             ' No process metrics will be returned.')
-            return
+            self.wmi_sampler.sample()
+        except TimeoutException:
+            self.logger.warning(
+                u"Timeout while querying Win32_PerfRawData_PerfOS_System WMI class."
+                u" Processes metrics will be returned at next iteration."
+            )
+            return []
 
-        try:
-            cpu = w.Win32_PerfFormattedData_PerfOS_Processor(name="_Total")[0]
-        except AttributeError:
-            self.logger.info('Missing Win32_PerfFormattedData_PerfOS_Processor WMI class.' \
+        if not (len(self.wmi_sampler)):
+            self.logger.warning('Missing Win32_PerfRawData_PerfOS_System WMI class.'
                              ' No process metrics will be returned.')
-            return
-        if os.ProcessorQueueLength is not None:
-            self.save_sample('system.proc.queue_length', os.ProcessorQueueLength)
-        if os.Processes is not None:
-            self.save_sample('system.proc.count', os.Processes)
+            return []
+
+        os = self.wmi_sampler[0]
+        processor_queue_length = os.get('ProcessorQueueLength')
+        processes = os.get('Processes')
+
+        if processor_queue_length is not None:
+            self.save_sample('system.proc.queue_length', processor_queue_length)
+        if processes is not None:
+            self.save_sample('system.proc.count', processes)
 
         return self.get_metrics()
+
 
 class Memory(Check):
     def __init__(self, logger):
         Check.__init__(self, logger)
-        self.logger = logger
+
+        # Sampler(s)
+        self.os_wmi_sampler = WMISampler(
+            logger,
+            "Win32_OperatingSystem",
+            ["TotalVisibleMemorySize", "FreePhysicalMemory"]
+        )
+        self.mem_wmi_sampler = WMISampler(
+            logger,
+            "Win32_PerfRawData_PerfOS_Memory",
+            ["CacheBytes", "CommittedBytes", "PoolPagedBytes", "PoolNonpagedBytes"])
+
         self.gauge('system.mem.free')
         self.gauge('system.mem.used')
         self.gauge('system.mem.total')
@@ -74,36 +113,73 @@ class Memory(Check):
         # usable = free + cached
         self.gauge('system.mem.usable')
         self.gauge('system.mem.pct_usable')
+        #  details about the usage of the pagefile.
+        self.gauge('system.mem.pagefile.total')
+        self.gauge('system.mem.pagefile.used')
+        self.gauge('system.mem.pagefile.free')
+        self.gauge('system.mem.pagefile.pct_free')
 
     def check(self, agentConfig):
         try:
-            os = w.Win32_OperatingSystem()[0]
-        except AttributeError:
-            self.logger.info('Missing Win32_OperatingSystem. No memory metrics will be returned.')
-            return
+            self.os_wmi_sampler.sample()
+        except TimeoutException:
+            self.logger.warning(
+                u"Timeout while querying Win32_OperatingSystem WMI class."
+                u" Memory metrics will be returned at next iteration."
+            )
+            return []
+
+        if not (len(self.os_wmi_sampler)):
+            self.logger.warning('Missing Win32_OperatingSystem WMI class.'
+                             ' No memory metrics will be returned.')
+            return []
+
+        os = self.os_wmi_sampler[0]
 
         total = 0
         free = 0
         cached = 0
 
-        if os.TotalVisibleMemorySize is not None and os.FreePhysicalMemory is not None:
-            total = int(os.TotalVisibleMemorySize) / KB2MB
-            free = int(os.FreePhysicalMemory) / KB2MB
+        total_visible_memory_size = os.get('TotalVisibleMemorySize')
+        free_physical_memory = os.get('FreePhysicalMemory')
+
+        if total_visible_memory_size is not None and free_physical_memory is not None:
+            total = int(total_visible_memory_size) / KB2MB
+            free = int(free_physical_memory) / KB2MB
             self.save_sample('system.mem.total', total)
             self.save_sample('system.mem.free', free)
             self.save_sample('system.mem.used', total - free)
 
+        try:
+            self.mem_wmi_sampler.sample()
+        except TimeoutException:
+            self.logger.warning(
+                u"Timeout while querying Win32_PerfRawData_PerfOS_Memory WMI class."
+                u" Memory metrics will be returned at next iteration."
+            )
+            return []
 
-        mem = w.Win32_PerfFormattedData_PerfOS_Memory()[0]
-        if mem.CacheBytes is not None:
-            cached = int(mem.CacheBytes) / B2MB
+        if not (len(self.mem_wmi_sampler)):
+            self.logger.info('Missing Win32_PerfRawData_PerfOS_Memory WMI class.'
+                             ' No memory metrics will be returned.')
+            return self.get_metrics()
+
+        mem = self.mem_wmi_sampler[0]
+
+        cache_bytes = mem.get('CacheBytes')
+        committed_bytes = mem.get('CommittedBytes')
+        pool_paged_bytes = mem.get('PoolPagedBytes')
+        pool_non_paged_bytes = mem.get('PoolNonpagedBytes')
+
+        if cache_bytes is not None:
+            cached = int(cache_bytes) / B2MB
             self.save_sample('system.mem.cached', cached)
-        if mem.CommittedBytes is not None:
-            self.save_sample('system.mem.committed', int(mem.CommittedBytes) / B2MB)
-        if mem.PoolPagedBytes is not None:
-            self.save_sample('system.mem.paged', int(mem.PoolPagedBytes) / B2MB)
-        if mem.PoolNonpagedBytes is not None:
-            self.save_sample('system.mem.nonpaged', int(mem.PoolNonpagedBytes) / B2MB)
+        if committed_bytes is not None:
+            self.save_sample('system.mem.committed', int(committed_bytes) / B2MB)
+        if pool_paged_bytes is not None:
+            self.save_sample('system.mem.paged', int(pool_paged_bytes) / B2MB)
+        if pool_non_paged_bytes is not None:
+            self.save_sample('system.mem.nonpaged', int(pool_non_paged_bytes) / B2MB)
 
         usable = free + cached
         self.save_sample('system.mem.usable', usable)
@@ -111,136 +187,49 @@ class Memory(Check):
             pct_usable = float(usable) / total
             self.save_sample('system.mem.pct_usable', pct_usable)
 
+        # swap_memory pulls from the pagefile data,
+        # rather than from the whole virtual memory data.
+        page = psutil.swap_memory()
+        if page.total is not None:
+            self.save_sample('system.mem.pagefile.total', page.total)
+            self.save_sample('system.mem.pagefile.used', page.used)
+            self.save_sample('system.mem.pagefile.free', page.free)
+            self.save_sample('system.mem.pagefile.pct_free', (100 - page.percent) / 100)
+
         return self.get_metrics()
+
 
 class Cpu(Check):
     def __init__(self, logger):
         Check.__init__(self, logger)
-        self.logger = logger
+
         self.counter('system.cpu.user')
         self.counter('system.cpu.idle')
-        self.gauge('system.cpu.interrupt')
         self.counter('system.cpu.system')
+        self.counter('system.cpu.interrupt')
 
     def check(self, agentConfig):
-        try:
-            cpu = w.Win32_PerfFormattedData_PerfOS_Processor()
-        except AttributeError:
-            self.logger.info('Missing Win32_PerfFormattedData_PerfOS_Processor WMI class.' \
-                             ' No CPU metrics will be returned.')
-            return
-
-        cpu_interrupt = self._average_metric(cpu, 'PercentInterruptTime')
-        if cpu_interrupt is not None:
-            self.save_sample('system.cpu.interrupt', cpu_interrupt)
-
         cpu_percent = psutil.cpu_times()
 
-        self.save_sample('system.cpu.user', 100 * cpu_percent.user / psutil.NUM_CPUS)
-        self.save_sample('system.cpu.idle', 100 * cpu_percent.idle / psutil.NUM_CPUS)
-        self.save_sample('system.cpu.system', 100 * cpu_percent.system/ psutil.NUM_CPUS)
+        self.save_sample('system.cpu.user', 100 * cpu_percent.user / psutil.cpu_count())
+        self.save_sample('system.cpu.idle', 100 * cpu_percent.idle / psutil.cpu_count())
+        self.save_sample('system.cpu.system', 100 * cpu_percent.system / psutil.cpu_count())
+        self.save_sample('system.cpu.interrupt', 100 * cpu_percent.interrupt / psutil.cpu_count())
 
         return self.get_metrics()
-
-    def _average_metric(self, wmi_class, wmi_prop):
-        ''' Sum all of the values of a metric from a WMI class object, excluding
-            the value for "_Total"
-        '''
-        val = 0
-        counter = 0
-        for wmi_object in wmi_class:
-            if wmi_object.Name == '_Total':
-                # Skip the _Total value
-                continue
-
-            if getattr(wmi_object, wmi_prop) is not None:
-                counter += 1
-                val += float(getattr(wmi_object, wmi_prop))
-
-        if counter > 0:
-            return val / counter
-
-        return val
-
-
-class Network(Check):
-    def __init__(self, logger):
-        Check.__init__(self, logger)
-        self.logger = logger
-        self.gauge('system.net.bytes_rcvd')
-        self.gauge('system.net.bytes_sent')
-
-    def check(self, agentConfig):
-        try:
-            net = w.Win32_PerfFormattedData_Tcpip_NetworkInterface()
-        except AttributeError:
-            self.logger.info('Missing Win32_PerfFormattedData_Tcpip_NetworkInterface WMI class.' \
-                             ' No network metrics will be returned')
-            return
-
-        for iface in net:
-            name = self.normalize_device_name(iface.name)
-            if iface.BytesReceivedPerSec is not None:
-                self.save_sample('system.net.bytes_rcvd', iface.BytesReceivedPerSec,
-                    device_name=name)
-            if iface.BytesSentPerSec is not None:
-                self.save_sample('system.net.bytes_sent', iface.BytesSentPerSec,
-                    device_name=name)
-        return self.get_metrics()
-
-class Disk(Check):
-    def __init__(self, logger):
-        Check.__init__(self, logger)
-        self.logger = logger
-        self.gauge('system.disk.free')
-        self.gauge('system.disk.total')
-        self.gauge('system.disk.in_use')
-        self.gauge('system.disk.used')
-        self.counter("system.disk.read_time_pct")
-        self.counter("system.disk.write_time_pct")
-
-    def check_disk_usage(self, agentConfig):
-        try:
-            disk = w.Win32_LogicalDisk()
-        except AttributeError:
-            self.logger.info('Missing Win32_LogicalDisk WMI class.'  \
-                             ' No disk metrics will be returned.')
-            return
-
-        blacklist_re = agentConfig.get('device_blacklist_re', None)
-        for device in disk:
-            name = self.normalize_device_name(device.name)
-            if device.DriveType in (DriveType.CD, DriveType.UNKNOWN) or should_ignore_disk(name, blacklist_re):
-                continue
-            if device.FreeSpace is not None and device.Size is not None:
-                free = float(device.FreeSpace) / B2KB
-                total = float(device.Size) / B2KB
-                used = total - free
-                self.save_sample('system.disk.free', free, device_name=name)
-                self.save_sample('system.disk.total', total, device_name=name)
-                self.save_sample('system.disk.used', used, device_name=name)
-                self.save_sample('system.disk.in_use', (used / total),
-                    device_name=name)
-
-    def check_disk_latency(self, agentConfig):
-        disk_io_counters = psutil.disk_io_counters(True)
-        for disk_name, disk in disk_io_counters.iteritems():
-            read_time_pct = disk.read_time * 100.0 / 1000.0 # x100 to have it as a percentage, /1000 as psutil returns the value in ms
-            write_time_pct = disk.write_time * 100.0 / 1000.0 # x100 to have it as a percentage, /1000 as psutil returns the value in ms
-            self.save_sample("system.disk.read_time_pct", read_time_pct, device_name=disk_name) 
-            self.save_sample("system.disk.write_time_pct", write_time_pct, device_name=disk_name)
-
-
-    def check(self, agentConfig):
-        self.check_disk_usage(agentConfig)
-        self.check_disk_latency(agentConfig)
-        return self.get_metrics()
-        
 
 class IO(Check):
     def __init__(self, logger):
         Check.__init__(self, logger)
-        self.logger = logger
+
+        #  Sampler(s)
+        self.wmi_sampler = WMISampler(
+            logger,
+            "Win32_PerfRawData_PerfDisk_LogicalDisk",
+            ["Name", "DiskWriteBytesPerSec", "DiskWritesPerSec", "DiskReadBytesPerSec",
+             "DiskReadsPerSec", "CurrentDiskQueueLength"]
+        )
+
         self.gauge('system.io.wkb_s')
         self.gauge('system.io.w_s')
         self.gauge('system.io.rkb_s')
@@ -249,29 +238,55 @@ class IO(Check):
 
     def check(self, agentConfig):
         try:
-            disk = w.Win32_PerfFormattedData_PerfDisk_LogicalDisk()
-        except AttributeError:
-            self.logger.info('Missing Win32_PerfFormattedData_PerfDisk_LogicalDiskUnable WMI class.' \
+            self.wmi_sampler.sample()
+        except TimeoutException:
+            self.logger.warning(
+                u"Timeout while querying Win32_PerfRawData_PerfDisk_LogicalDiskUnable WMI class."
+                u" I/O metrics will be returned at next iteration."
+            )
+            return []
+
+        if not (len(self.wmi_sampler)):
+            self.logger.warning('Missing Win32_PerfRawData_PerfDisk_LogicalDiskUnable WMI class.'
                              ' No I/O metrics will be returned.')
-            return
+            return []
+
         blacklist_re = agentConfig.get('device_blacklist_re', None)
-        for device in disk:
-            name = self.normalize_device_name(device.name)
+        for device in self.wmi_sampler:
+            name = device.get('Name')
+            disk_write_bytes_per_sec = device.get('DiskWriteBytesPerSec')
+            disk_writes_per_sec = device.get('DiskWritesPerSec')
+            disk_read_bytes_per_sec = device.get('DiskReadBytesPerSec')
+            disk_reads_per_sec = device.get('DiskReadsPerSec')
+            current_disk_queue_length = device.get('CurrentDiskQueueLength')
+
+            name = self.normalize_device_name(name)
             if should_ignore_disk(name, blacklist_re):
                 continue
-            if device.DiskWriteBytesPerSec is not None:
-                self.save_sample('system.io.wkb_s', int(device.DiskWriteBytesPerSec) / B2KB,
-                    device_name=name)
-            if device.DiskWritesPerSec is not None:
-                self.save_sample('system.io.w_s', int(device.DiskWritesPerSec),
-                    device_name=name)
-            if device.DiskReadBytesPerSec is not None:
-                self.save_sample('system.io.rkb_s', int(device.DiskReadBytesPerSec) / B2KB,
-                    device_name=name)
-            if device.DiskReadsPerSec is not None:
-                self.save_sample('system.io.r_s', int(device.DiskReadsPerSec),
-                    device_name=name)
-            if device.CurrentDiskQueueLength is not None:
-                self.save_sample('system.io.avg_q_sz', device.CurrentDiskQueueLength,
-                    device_name=name)
+            if disk_write_bytes_per_sec is not None:
+                self.save_sample('system.io.wkb_s', int(disk_write_bytes_per_sec) / B2KB,
+                                 device_name=name)
+            if disk_writes_per_sec is not None:
+                self.save_sample('system.io.w_s', int(disk_writes_per_sec),
+                                 device_name=name)
+            if disk_read_bytes_per_sec is not None:
+                self.save_sample('system.io.rkb_s', int(disk_read_bytes_per_sec) / B2KB,
+                                 device_name=name)
+            if disk_reads_per_sec is not None:
+                self.save_sample('system.io.r_s', int(disk_reads_per_sec),
+                                 device_name=name)
+            if current_disk_queue_length is not None:
+                self.save_sample('system.io.avg_q_sz', current_disk_queue_length,
+                                 device_name=name)
+        return self.get_metrics()
+
+
+class System(Check):
+    def __init__(self, logger):
+        Check.__init__(self, logger)
+        self.gauge('system.uptime')
+
+    def check(self, agentConfig):
+        self.save_sample('system.uptime', uptime.uptime())
+
         return self.get_metrics()
