@@ -29,6 +29,7 @@ class Unbound(AgentCheck):
                 if '.num.' in k:
                     self.log.debug("HISTOGRAM: " + metric + " : " + value)
                     self.histogram(metric=metric, value=value)
+                # If the metric does not contain num, it's an aggregate value and can be sent as a gauge
                 else:
                     self.log.debug("GAUGE: " + metric + " : " + value)
                     self.gauge(metric=metric, value=value)
