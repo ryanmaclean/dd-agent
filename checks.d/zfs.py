@@ -113,7 +113,7 @@ class Zfs(AgentCheck):
         :return: List of zpools
         """
         p = self.subprocess.Popen(
-            'sudo zpool list -H -o name'.split(),
+            'zpool list -H -o name'.split(),
             stdout=self.subprocess.PIPE
             )
         zpools, err = p.communicate()
@@ -127,7 +127,7 @@ class Zfs(AgentCheck):
         :return:
         """
         p = self.subprocess.Popen(
-            'sudo zpool get {props} {name}'.format(
+            'zpool get {props} {name}'.format(
                 props=','.join(Zfs.zpool_metrics),
                 name=zpool
             ).split(),
@@ -154,7 +154,7 @@ class Zfs(AgentCheck):
         :return:
         """
         p = subprocess.Popen(
-            'sudo zpool iostat -v {name}'.format(
+            'zpool iostat -v {name}'.format(
                 name=zpool
             ).split(),
             stdout=subprocess.PIPE
@@ -203,7 +203,7 @@ class Zfs(AgentCheck):
         :return:
         """
         p = self.subprocess.Popen(
-            'sudo zpool get {props} {name}'.format(
+            'zpool get {props} {name}'.format(
                 props=','.join(Zfs.zpool_service_checks),
                 name=zpool
             ).split(),
@@ -246,7 +246,7 @@ class Zfs(AgentCheck):
         :return: List of zfs filesystems
         """
         p = self.subprocess.Popen(
-            'sudo zfs list -o name -H'.split(),
+            'zfs list -o name -H'.split(),
             stdout=self.subprocess.PIPE
             )
         zfs_filesystems, err = p.communicate()
@@ -254,7 +254,7 @@ class Zfs(AgentCheck):
 
     def _get_zfs_stats(self, zfs_name):
         p = self.subprocess.Popen(
-            'sudo zfs get -o property,value -p {props} -H {name}'.format(
+            'zfs get -o property,value -p {props} -H {name}'.format(
                 props=','.join(Zfs.zfs_metrics),
                 name=zfs_name).split(),
             stdout=self.subprocess.PIPE
